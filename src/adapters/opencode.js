@@ -12,7 +12,7 @@ const KNOWN_PART_TYPES = new Set(['text', 'reasoning', 'tool', 'step-start', 'st
 const TOOL_ROOMS = new Map([
   ['read', 'library'], ['glob', 'library'], ['grep', 'library'],
   ['edit', 'dev'], ['write', 'dev'], ['patch', 'dev'],
-  ['bash', 'server'], ['webfetch', 'search'], ['websearch', 'search']
+  ['bash', 'server'], ['shell', 'server'], ['webfetch', 'search'], ['websearch', 'search']
 ]);
 // 이벤트에 싣는 도구 이름은 알려진 기본 도구로 제한한다. MCP·플러그인 도구는 서버 이름이 드러나지 않게 mcp로 줄인다.
 const KNOWN_TOOLS = new Set([...TOOL_ROOMS.keys(), 'task', 'todowrite', 'todoread', 'list', 'skill', 'question', 'lsp',
@@ -51,6 +51,27 @@ const PART_CURSOR_SQL = `SELECT id, time_updated, json_extract(data, '$.type') A
   (time_updated > ? OR (time_updated = ? AND id > ?))
   ORDER BY time_updated, id LIMIT ?`;
 
+// V2 keeps message roles in a column and content inline, not in the legacy part table.
+// Extract structural metadata in SQL so prompts, reasoning, and tool payloads never leave SQLite.
+const V2_MESSAGE_COLUMNS = `SELECT id, time_created, time_updated, type AS role,
+  json_extract(data, '$.time.completed') AS completed,
+  (SELECT json_group_array(json_object(
+    'ordinal', content.key, 'type', json_extract(content.value, '$.type'),
+    'tool', json_extract(content.value, '$.name'),
+    'status', json_extract(content.value, '$.state.status'),
+    'created', json_extract(content.value, '$.time.created'),
+    'completed', json_extract(content.value, '$.time.completed')
+  )) FROM (SELECT key, value FROM json_each(session_message.data, '$.content') LIMIT ${PART_LIMIT}) content) AS parts
+  FROM session_message WHERE session_id = ? AND `;
+const V2_MESSAGE_SQL = `${V2_MESSAGE_COLUMNS}time_updated >= ? ORDER BY time_updated, id LIMIT ?`;
+const V2_MESSAGE_CURSOR_SQL = `${V2_MESSAGE_COLUMNS}(time_updated > ? OR (time_updated = ? AND id > ?))
+  ORDER BY time_updated, id LIMIT ?`;
+
+function databaseSchema(database) {
+  const v2 = database.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' AND name = 'session_v2'").get();
+  return v2 ? 'v2' : 'legacy';
+}
+
 function configuredDatabasePath(config, fallback, platform) {
   const selected = typeof config?.path === 'string' && config.path.trim() ? config.path.trim() : fallback;
   const pathApi = platform === 'win32' ? win32 : posix;
@@ -87,6 +108,7 @@ export function createOpenCodeAdapter({
   const lastActivityAt = new Map();
   const lastRoom = new Map();
   const lastTextEventAt = new Map();
+  const v2Records = new Map();
   let ignoredCount = 0;
   let unknownCount = 0;
   let databaseErrorCount = 0;
@@ -125,13 +147,44 @@ export function createOpenCodeAdapter({
     return database.prepare(sql).all(...params);
   }
 
+  function v2MessageRecords(messages, sessionId) {
+    const seen = v2Records.get(sessionId) ?? new Map();
+    v2Records.set(sessionId, seen);
+    const records = [];
+    for (const row of messages) {
+      const signature = `${row.role}:${row.completed ?? ''}`;
+      if (seen.get(row.id) !== signature) {
+        seen.set(row.id, signature);
+        // V2 also stores system/idle/location messages; they are not conversation turns.
+        if (row.role === 'user' || row.role === 'assistant') {
+          records.push({ category: 'message', row,
+            ts: timestamp(row.completed) ?? timestamp(row.time_created) ?? now() });
+        }
+      }
+      for (const part of JSON.parse(row.parts)) {
+        const id = `${row.id}:${part.ordinal}`;
+        const signature = JSON.stringify([part.type, part.tool, part.status,
+          part.type === 'tool' ? part.completed ?? part.created : row.time_updated]);
+        if (seen.get(id) === signature) continue;
+        seen.set(id, signature);
+        // Streaming text/reasoning can have an old creation time while still being updated.
+        const activityTime = part.type === 'tool' ? part.created : row.time_updated;
+        records.push({ category: 'part', row: { ...part, id },
+          ts: timestamp(part.completed) ?? timestamp(activityTime) ?? timestamp(row.time_updated) ?? now() });
+      }
+    }
+    return records;
+  }
+
   function poll(sourceConfig = {}) {
     const path = configuredDatabasePath(sourceConfig, fallbackPath, platform);
     let database;
     try {
       database = databaseFactory(path, { readOnly: true });
+      const schema = databaseSchema(database);
       const cutoff = now() - RESTORE_WINDOW_MS;
-      const sessions = queryRows(database, SESSION_SQL, [cutoff, SESSION_LIMIT]);
+      const sessions = queryRows(database, schema === 'v2' ? SESSION_SQL.replace('FROM session ', 'FROM session_v2 ') : SESSION_SQL,
+        [cutoff, SESSION_LIMIT]);
       const projectIds = [...new Set(sessions.map((row) => row.project_id).filter((id) => id !== null))];
       const projects = projectIds.length
         ? new Map(queryRows(database, projectQuery(projectIds), projectIds).map((row) => [row.id, row.project]))
@@ -147,16 +200,29 @@ export function createOpenCodeAdapter({
           project: typeof row.project_id === 'string' && projects.get(row.project_id)
             ? projects.get(row.project_id) : null };
         const cursor = cursors.get(session.id) ?? { messages: null, parts: null };
+        const messageSql = schema === 'v2' ? V2_MESSAGE_SQL : MESSAGE_SQL;
+        const messageCursorSql = schema === 'v2' ? V2_MESSAGE_CURSOR_SQL : MESSAGE_CURSOR_SQL;
         const messages = cursor.messages
-          ? queryRows(database, MESSAGE_CURSOR_SQL, [session.id, cursor.messages.time, cursor.messages.time, cursor.messages.id, MESSAGE_LIMIT])
-          : queryRows(database, MESSAGE_SQL, [session.id, cutoff, MESSAGE_LIMIT]);
-        const parts = cursor.parts
+          ? queryRows(database, messageCursorSql, [session.id, cursor.messages.time, cursor.messages.time, cursor.messages.id, MESSAGE_LIMIT])
+          : queryRows(database, messageSql, [session.id, cutoff, MESSAGE_LIMIT]);
+        const parts = schema === 'v2' ? [] : cursor.parts
           ? queryRows(database, PART_CURSOR_SQL, [session.id, cursor.parts.time, cursor.parts.time, cursor.parts.id, PART_LIMIT])
           : queryRows(database, PART_SQL, [session.id, cutoff, PART_LIMIT]);
-        const records = [
+        const records = (schema === 'v2' ? v2MessageRecords(messages, session.id) : [
           ...messages.map((row) => ({ category: 'message', row, ts: timestamp(row.time_updated) ?? now() })),
           ...parts.map((row) => ({ category: 'part', row, ts: timestamp(row.time_updated) ?? now() }))
-        ].sort((left, right) => left.ts - right.ts || String(left.row.id).localeCompare(String(right.row.id)));
+        ]).sort((left, right) => left.ts - right.ts
+          || Number(left.category === 'message' && left.row.role === 'assistant')
+            - Number(right.category === 'message' && right.row.role === 'assistant')
+          || String(left.row.id).localeCompare(String(right.row.id)));
+        if (messages.length) {
+          const last = messages.at(-1);
+          cursor.messages = { time: last.time_updated, id: last.id };
+        }
+        if (parts.length) {
+          const last = parts.at(-1);
+          cursor.parts = { time: last.time_updated, id: last.id };
+        }
         for (const record of records) {
           const { row, ts } = record;
           if (record.category === 'message') {
@@ -167,7 +233,6 @@ export function createOpenCodeAdapter({
             } else if (row.role !== 'user' && row.role !== 'assistant') {
               ignoredCount += 1;
             }
-            cursor.messages = { time: row.time_updated, id: row.id };
             continue;
           }
 
@@ -204,7 +269,6 @@ export function createOpenCodeAdapter({
           } else {
             unknownCount += 1;
           }
-          cursor.parts = { time: row.time_updated, id: row.id };
         }
         cursors.set(session.id, cursor);
 
